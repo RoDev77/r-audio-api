@@ -5,7 +5,6 @@ const https   = require('https');
 const http    = require('http');
 const fs      = require('fs');
 const path    = require('path');
-const { execSync } = require('child_process');
 
 const app = express();
 app.use(cors());
@@ -37,9 +36,8 @@ app.post('/api/extract', async (req, res) => {
 
   const platform    = detectPlatform(url);
   const cookiesFile = writeCookies();
-  console.log(`[extract] platform=${platform} cookies=${cookiesFile}`);
+  console.log(`[extract] platform=${platform} cookies=${!!cookiesFile}`);
 
-  // Opsi dasar
   const base = {
     dumpJson:           true,
     noWarnings:         true,
@@ -49,133 +47,108 @@ app.post('/api/extract', async (req, res) => {
     ...(cookiesFile ? { cookies: cookiesFile } : {}),
   };
 
-  // Untuk YouTube coba beberapa kombinasi client + format
-  // tv_embedded = tidak perlu login untuk video publik
-  // mweb       = mobile web, juga sering lolos
-  const ytStrategies = [
-    { extractorArgs: 'youtube:player_client=tv_embedded', format: 'bestaudio[ext=m4a]/bestaudio' },
-    { extractorArgs: 'youtube:player_client=mweb',        format: 'bestaudio[ext=m4a]/bestaudio' },
-    { extractorArgs: 'youtube:player_client=android',     format: 'bestaudio[ext=m4a]/bestaudio' },
-    { extractorArgs: 'youtube:player_client=web',         format: 'bestaudio' },
-  ];
-
-  const tiktokOpts = {
-    ...base,
-    format: 'bestaudio/best',
-    addHeader: [
-      'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
-      'Referer:https://www.tiktok.com/',
-    ],
-  };
-
   if (platform === 'tiktok') {
     try {
-      const out = await ytDlp(url, tiktokOpts);
+      const out = await ytDlp(url, {
+        ...base,
+        format: 'bestaudio/best',
+        addHeader: [
+          'User-Agent:Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15',
+          'Referer:https://www.tiktok.com/',
+        ],
+      });
       if (!out?.url) throw new Error('Tidak ada URL');
       const title = (out.title || 'TikTok_Audio').replace(/[^\w\s-]/g,'').replace(/\s+/g,'_').substring(0,80);
-      return res.json({ success: true, title, streamUrl: out.url, duration: out.duration || null, ext: out.ext || 'mp3' });
+      return res.json({ success: true, title, streamUrl: out.url, duration: out.duration||null, ext: out.ext||'mp3' });
     } catch (e) {
-      return res.status(500).json({ error: 'Gagal ekstrak TikTok: ' + e.message.substring(0,200) });
+      return res.status(500).json({ error: 'Gagal ekstrak TikTok.', detail: e.message.substring(0,300) });
     }
   }
 
-  // YouTube — coba semua strategy
+  // YouTube — 4 strategy fallback
+  const strategies = [
+    'youtube:player_client=tv_embedded',
+    'youtube:player_client=mweb',
+    'youtube:player_client=android',
+    'youtube:player_client=web',
+  ];
+
   let lastErr = null;
-  for (const strategy of ytStrategies) {
-    const opts = {
-      ...base,
-      ...strategy,
-      addHeader: [
-        'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
-        'Accept-Language:en-US,en;q=0.9',
-        'Referer:https://www.youtube.com/',
-      ],
-      youtubeSkipDashManifest: true,
-    };
-
+  for (const strategy of strategies) {
     try {
-      console.log(`[extract] Trying ${strategy.extractorArgs}`);
-      const out = await ytDlp(url, opts);
+      console.log(`[extract] Trying ${strategy}`);
+      const out = await ytDlp(url, {
+        ...base,
+        format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
+        extractorArgs: strategy,
+        youtubeSkipDashManifest: true,
+        addHeader: [
+          'User-Agent:Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36',
+          'Accept-Language:en-US,en;q=0.9',
+          'Referer:https://www.youtube.com/',
+        ],
+      });
       if (!out?.url) throw new Error('Tidak ada URL di output');
-
-      const title = (out.title || 'Sonara_Audio').replace(/[^\w\s-]/g,'').replace(/\s+/g,'_').substring(0,80);
-      console.log(`[extract] ✅ "${title}" via ${strategy.extractorArgs}`);
-      return res.json({ success: true, title, streamUrl: out.url, duration: out.duration || null, ext: out.ext || 'mp3' });
-
+      const title = (out.title||'Sonara_Audio').replace(/[^\w\s-]/g,'').replace(/\s+/g,'_').substring(0,80);
+      console.log(`[extract] ✅ "${title}" via ${strategy}`);
+      return res.json({ success: true, title, streamUrl: out.url, duration: out.duration||null, ext: out.ext||'mp3' });
     } catch (err) {
       lastErr = err;
       const m = err.message || '';
-      console.warn(`[extract] ❌ ${strategy.extractorArgs}: ${m.substring(0,120)}`);
-      // Error non-recoverable — tidak perlu coba strategy lain
-      if (m.includes('private') || m.includes('removed') || m.includes('unavailable') || m.includes('copyright'))
-        break;
+      console.warn(`[extract] ❌ ${strategy}: ${m.substring(0,120)}`);
+      if (m.includes('private') || m.includes('removed') || m.includes('unavailable') || m.includes('copyright')) break;
     }
   }
 
-  // Semua gagal — kembalikan error terbaik
   const msg = lastErr?.message || '';
-  let userMsg;
-  if (msg.includes('private'))
-    userMsg = 'Video diprivate.';
-  else if (msg.includes('unavailable') || msg.includes('removed'))
-    userMsg = 'Video tidak tersedia atau sudah dihapus.';
-  else if (msg.includes('copyright') || msg.includes('not available'))
-    userMsg = 'Video diblokir hak cipta atau tidak tersedia di wilayah server.';
-  else if (msg.includes('Sign in') || msg.includes('login') || msg.includes('bot') || msg.includes('age'))
-    userMsg = cookiesFile
-      ? 'YouTube memblokir server ini. Coba video lain atau perbarui cookies.'
-      : 'Video butuh login. Pasang COOKIES_BASE64 di Railway.';
-  else
-    userMsg = 'Gagal mengekstrak. Coba video lain.';
+  let userMsg = 'Gagal mengekstrak. Coba video lain.';
+  if (msg.includes('private'))                                             userMsg = 'Video diprivate.';
+  else if (msg.includes('unavailable') || msg.includes('removed'))        userMsg = 'Video tidak tersedia atau dihapus.';
+  else if (msg.includes('copyright') || msg.includes('not available'))    userMsg = 'Video diblokir hak cipta di wilayah server.';
+  else if (msg.includes('Sign in') || msg.includes('bot') || msg.includes('age')) userMsg = 'YouTube memblokir server. Perbarui cookies atau coba video lain.';
 
   res.status(500).json({ error: userMsg, detail: msg.substring(0,400) });
 });
 
-// ── GET /api/debug — info lengkap untuk troubleshooting ──────────────────────
+// ── GET /api/debug ────────────────────────────────────────────────────────────
 app.get('/api/debug', async (req, res) => {
+  const cookiesFile = writeCookies();
   const info = {
-    node:     process.version,
-    platform: process.platform,
+    node: process.version,
     cookies: {
       hasBase64: !!process.env.COOKIES_BASE64,
       hasFile:   fs.existsSync(COOKIES_PATH),
+      loaded:    !!cookiesFile,
     },
   };
 
-  // Info versi yt-dlp
-  try {
-    info.ytdlpVersion = execSync('yt-dlp --version', { timeout: 5000 }).toString().trim();
-  } catch (_) { info.ytdlpVersion = 'unknown'; }
-
-  // Analisis cookies
-  const cookiesFile = writeCookies();
   if (cookiesFile) {
-    const content = fs.readFileSync(cookiesFile, 'utf8');
-    const lines   = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
-    const domains = [...new Set(lines.map(l => l.split('\t')[0]).filter(Boolean))];
-    info.cookies.entries    = lines.length;
-    info.cookies.domains    = domains;
-    info.cookies.hasYT      = domains.some(d => d.includes('youtube') || d.includes('google'));
-    info.cookies.byteLength = content.length;
-    // Cek apakah ada cookie VISITOR_INFO atau LOGIN_INFO (tanda login)
-    info.cookies.hasLoginToken = content.includes('LOGIN_INFO') || content.includes('SID') || content.includes('HSID');
-    // Sample baris pertama non-sensitif
-    info.cookies.firstDomains = lines.slice(0,5).map(l => l.split('\t')[0]);
+    try {
+      const content = fs.readFileSync(cookiesFile, 'utf8');
+      const lines   = content.split('\n').filter(l => l.trim() && !l.startsWith('#'));
+      const domains = [...new Set(lines.map(l => l.split('\t')[0]).filter(Boolean))];
+      info.cookies.entries        = lines.length;
+      info.cookies.domains        = domains;
+      info.cookies.hasYT          = domains.some(d => d.includes('youtube') || d.includes('google'));
+      info.cookies.hasLoginToken  = content.includes('LOGIN_INFO') || content.includes('SSID') || content.includes('SID');
+      info.cookies.byteLength     = content.length;
+    } catch (e) {
+      info.cookies.readError = e.message;
+    }
   }
 
-  // Test cepat yt-dlp tanpa download (video pendek publik)
-  if (req.query.test === '1') {
+  // Live test (opsional, tambah ?test=1)
+  if (req.query.test === '1' && cookiesFile) {
     try {
-      const testUrl = 'https://www.youtube.com/watch?v=BaW_jenozKc'; // video test YouTube
-      const out = await ytDlp(testUrl, {
+      const out = await ytDlp('https://www.youtube.com/watch?v=BaW_jenozKc', {
         dumpJson: true, noWarnings: true, noCallHome: true,
         format: 'bestaudio',
         extractorArgs: 'youtube:player_client=tv_embedded',
-        ...(cookiesFile ? { cookies: cookiesFile } : {}),
+        cookies: cookiesFile,
       });
-      info.ytdlpTest = { ok: true, title: out.title };
+      info.liveTest = { ok: true, title: out.title };
     } catch (e) {
-      info.ytdlpTest = { ok: false, error: e.message.substring(0, 300) };
+      info.liveTest = { ok: false, error: e.message.substring(0,300) };
     }
   }
 
