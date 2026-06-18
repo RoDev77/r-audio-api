@@ -10,38 +10,25 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-// ── Cookies setup ─────────────────────────────────────────────────────────────
-// Cara pasang cookies (pilih salah satu):
-//
-// OPSI A — File (lokal/Railway volume):
-//   1. Install ekstensi Chrome: "Get cookies.txt LOCALLY"
-//   2. Buka youtube.com saat login, klik ekstensi → Export
-//   3. Simpan sebagai cookies.txt di root project
-//   4. Set env: COOKIES_PATH=/app/cookies.txt  (atau biarkan default)
-//
-// OPSI B — Base64 env variable (lebih aman, tidak perlu file):
-//   1. Export cookies.txt seperti di atas
-//   2. Encode: base64 -w 0 cookies.txt   (Linux/Mac)
-//              [Convert]::ToBase64String([IO.File]::ReadAllBytes("cookies.txt"))  (Windows PS)
-//   3. Set env di Railway: COOKIES_BASE64=<hasil encode>
-//
 const COOKIES_PATH = process.env.COOKIES_PATH || path.join(__dirname, 'cookies.txt');
 
 function getCookiesOpt() {
   if (process.env.COOKIES_BASE64) {
     const tmpPath = '/tmp/yt_cookies.txt';
-    // Tulis ulang hanya jika env berubah (cek ukuran)
-    const encoded = process.env.COOKIES_BASE64;
-    const decoded = Buffer.from(encoded, 'base64').toString('utf8');
+    const decoded = Buffer.from(process.env.COOKIES_BASE64, 'base64').toString('utf8');
     fs.writeFileSync(tmpPath, decoded);
-    console.log('[cookies] Dimuat dari env COOKIES_BASE64 (' + decoded.length + ' bytes)');
+    const lines = decoded.split('\n').filter(l => l && !l.startsWith('#'));
+    console.log(`[cookies] COOKIES_BASE64: ${decoded.length} bytes, ${lines.length} entries`);
+    // Log beberapa domain untuk verifikasi (jangan log value cookie)
+    const domains = [...new Set(lines.map(l => l.split('\t')[0]).filter(Boolean))];
+    console.log('[cookies] Domains:', domains.slice(0, 10));
     return { cookies: tmpPath };
   }
   if (fs.existsSync(COOKIES_PATH)) {
-    console.log('[cookies] Dimuat dari file:', COOKIES_PATH);
+    console.log('[cookies] File:', COOKIES_PATH);
     return { cookies: COOKIES_PATH };
   }
-  console.warn('[cookies] ⚠️  Tidak ada cookies — video yang butuh login akan gagal.');
+  console.warn('[cookies] ⚠️  Tidak ada cookies');
   return {};
 }
 
@@ -56,10 +43,10 @@ app.post('/api/extract', async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'URL kosong!' });
 
-  const platform    = detectPlatform(url);
-  const cookiesOpt  = getCookiesOpt();
-  const hasCookies  = !!cookiesOpt.cookies;
-  console.log(`[extract] platform=${platform} cookies=${hasCookies} url=${url}`);
+  const platform   = detectPlatform(url);
+  const cookiesOpt = getCookiesOpt();
+  const hasCookies = !!cookiesOpt.cookies;
+  console.log(`[extract] platform=${platform} cookies=${hasCookies}`);
 
   const baseOpts = {
     dumpJson:           true,
@@ -74,50 +61,88 @@ app.post('/api/extract', async (req, res) => {
     ],
   };
 
-  const platformOpts = platform === 'youtube'
-    ? {
+  // ── Strategi: coba 3 player client secara berurutan ──────────────────────
+  // tv_embedded paling jarang kena bot-check, tidak butuh login untuk video publik
+  const clientStrategies = platform === 'youtube'
+    ? [
+        'youtube:player_client=tv_embedded',   // ← tidak butuh login, paling bebas
+        'youtube:player_client=android',
+        'youtube:player_client=web',
+      ]
+    : [null]; // TikTok tidak pakai extractorArgs
+
+  let lastError = null;
+
+  for (const strategy of clientStrategies) {
+    const opts = {
+      ...baseOpts,
+      ...(platform === 'youtube' ? {
         format: 'bestaudio[ext=m4a]/bestaudio[ext=webm]/bestaudio',
         addHeader: [...baseOpts.addHeader, 'Referer:https://www.youtube.com/'],
         youtubeSkipDashManifest: true,
-        // android client jarang kena bot-check, web sebagai fallback
-        extractorArgs: 'youtube:player_client=android,web',
-      }
-    : {
+        ...(strategy ? { extractorArgs: strategy } : {}),
+      } : {
         format: 'bestaudio/best',
         addHeader: [...baseOpts.addHeader, 'Referer:https://www.tiktok.com/'],
-      };
+      }),
+    };
 
-  try {
-    const output = await ytDlp(url, { ...baseOpts, ...platformOpts });
+    try {
+      console.log(`[extract] Mencoba strategy: ${strategy || 'default'}`);
+      const output = await ytDlp(url, opts);
+      if (!output?.url) throw new Error('Tidak ada URL di output');
 
-    if (!output?.url) throw new Error('yt-dlp tidak mengembalikan stream URL.');
+      const safeTitle = (output.title || 'Sonara_Audio')
+        .replace(/[^\w\s-]/g, '').replace(/\s+/g, '_').substring(0, 80);
 
-    const safeTitle = (output.title || 'Sonara_Audio')
-      .replace(/[^\w\s-]/g, '').replace(/\s+/g, '_').substring(0, 80);
-
-    console.log(`[extract] ✅ "${safeTitle}"`);
-    res.json({ success: true, title: safeTitle, streamUrl: output.url, duration: output.duration || null, ext: output.ext || 'mp3' });
-
-  } catch (err) {
-    const msg = err.message || '';
-    console.error('[extract] ❌', msg.substring(0, 300));
-
-    let userMsg = 'Gagal mengekstrak audio. Coba video lain.';
-    if (msg.includes('Sign in') || msg.includes('login') || msg.includes('age') || msg.includes('confirm your age'))
-      userMsg = hasCookies
-        ? 'Cookies sudah kedaluwarsa — perbarui cookies.txt di server lalu redeploy.'
-        : 'Video ini butuh login YouTube. Pasang cookies.txt di server (lihat README).';
-    else if (msg.includes('copyright') || msg.includes('blocked') || msg.includes('not available in your country'))
-      userMsg = 'Video diblokir hak cipta atau tidak tersedia di wilayah server.';
-    else if (msg.includes('private'))
-      userMsg = 'Video diprivate — tidak dapat diakses.';
-    else if (msg.includes('unavailable') || msg.includes('removed') || msg.includes('This video is no longer'))
-      userMsg = 'Video tidak tersedia atau sudah dihapus.';
-    else if (msg.includes('network') || msg.includes('timed out') || msg.includes('connect'))
-      userMsg = 'Timeout koneksi ke YouTube. Coba lagi sebentar.';
-
-    res.status(500).json({ error: userMsg, detail: msg.substring(0, 500) });
+      console.log(`[extract] ✅ "${safeTitle}" via ${strategy || 'default'}`);
+      return res.json({
+        success: true, title: safeTitle,
+        streamUrl: output.url, duration: output.duration || null, ext: output.ext || 'mp3',
+      });
+    } catch (err) {
+      lastError = err;
+      console.warn(`[extract] ❌ ${strategy}: ${err.message.substring(0, 150)}`);
+      // Jika bukan masalah player client, jangan coba strategy lain
+      if (!err.message.includes('Sign in') && !err.message.includes('bot') && !err.message.includes('age')) {
+        break;
+      }
+    }
   }
+
+  // Semua strategy gagal
+  const msg = lastError?.message || '';
+  console.error('[extract] Semua strategy gagal:', msg.substring(0, 300));
+
+  let userMsg = 'Gagal mengekstrak audio. Coba video lain.';
+  if (msg.includes('Sign in') || msg.includes('login') || msg.includes('age') || msg.includes('confirm your age'))
+    userMsg = hasCookies
+      ? 'Cookies kedaluwarsa — export ulang cookies.txt lalu update COOKIES_BASE64 di Railway.'
+      : 'Video butuh login. Pasang COOKIES_BASE64 di Railway.';
+  else if (msg.includes('copyright') || msg.includes('blocked') || msg.includes('not available'))
+    userMsg = 'Video diblokir hak cipta atau tidak tersedia di wilayah server.';
+  else if (msg.includes('private'))
+    userMsg = 'Video diprivate.';
+  else if (msg.includes('unavailable') || msg.includes('removed'))
+    userMsg = 'Video tidak tersedia atau sudah dihapus.';
+
+  res.status(500).json({ error: userMsg, detail: msg.substring(0, 500) });
+});
+
+// ── GET /api/debug-cookies — cek status cookies tanpa expose nilainya ─────────
+app.get('/api/debug-cookies', (req, res) => {
+  const result = { hasCookiesBase64: !!process.env.COOKIES_BASE64, hasCookiesFile: fs.existsSync(COOKIES_PATH) };
+  if (process.env.COOKIES_BASE64) {
+    const decoded = Buffer.from(process.env.COOKIES_BASE64, 'base64').toString('utf8');
+    const lines   = decoded.split('\n').filter(l => l && !l.startsWith('#'));
+    const domains = [...new Set(lines.map(l => l.split('\t')[0]).filter(Boolean))];
+    result.cookieEntries = lines.length;
+    result.domains       = domains;
+    result.byteLength    = decoded.length;
+    // Cek apakah ada .youtube.com cookie
+    result.hasYoutubeCookie = domains.some(d => d.includes('youtube') || d.includes('google'));
+  }
+  res.json(result);
 });
 
 // ── GET /proxy ────────────────────────────────────────────────────────────────
@@ -133,20 +158,22 @@ app.get('/proxy', (req, res) => {
   };
   if (req.headers.range) reqHeaders['Range'] = req.headers.range;
 
-  const lib = targetUrl.startsWith('https') ? https : http;
+  const lib      = targetUrl.startsWith('https') ? https : http;
   const upstream = lib.get(targetUrl, { headers: reqHeaders }, (upRes) => {
-    const passHeaders = ['content-type','content-length','content-range','accept-ranges','cache-control'];
-    const outHeaders  = { 'Access-Control-Allow-Origin': '*' };
-    passHeaders.forEach(h => { if (upRes.headers[h]) outHeaders[h] = upRes.headers[h]; });
-    res.writeHead(upRes.statusCode, outHeaders);
+    const pass    = ['content-type','content-length','content-range','accept-ranges','cache-control'];
+    const outH    = { 'Access-Control-Allow-Origin': '*' };
+    pass.forEach(h => { if (upRes.headers[h]) outH[h] = upRes.headers[h]; });
+    res.writeHead(upRes.statusCode, outH);
     upRes.pipe(res);
   });
-  upstream.on('error', e => { console.error('[proxy]', e.message); if (!res.headersSent) res.status(502).send('Proxy error'); });
+  upstream.on('error', e => { if (!res.headersSent) res.status(502).send('Proxy error'); });
   req.on('close', () => upstream.destroy());
 });
 
-// ── Health check ──────────────────────────────────────────────────────────────
-app.get('/', (_, res) => res.json({ status: 'ok', service: 'Sonara Studio API', cookies: fs.existsSync(COOKIES_PATH) || !!process.env.COOKIES_BASE64 }));
+app.get('/', (_, res) => res.json({
+  status: 'ok', service: 'Sonara Studio API',
+  cookies: fs.existsSync(COOKIES_PATH) || !!process.env.COOKIES_BASE64,
+}));
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 Sonara API di port ${PORT}`));
