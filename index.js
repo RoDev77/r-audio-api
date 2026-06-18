@@ -35,5 +35,17 @@ app.post('/api/extract', async (req, res) => {
     }
 });
 
+// Rute Proxy untuk bypass CORS saat mendownload file audio
+app.get('/proxy', async (req, res) => {
+    const url = req.query.url;
+    if (!url) return res.status(400).send("Missing URL");
+    try {
+        const response = await fetch(url);
+        response.body.pipe(res);
+    } catch (e) {
+        res.status(500).send("Proxy Error");
+    }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🚀 API berjalan di port ${PORT}`));
