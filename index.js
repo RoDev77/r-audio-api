@@ -15,6 +15,7 @@ app.post('/api/extract', async (req, res) => {
         const output = await ytDlp(url, {
             dumpJson: true,
             format: 'bestaudio',
+            userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36', // Tambahkan ini
             noWarnings: true,
             noCallHome: true,
             noCheckCertificate: true,
